@@ -1667,10 +1667,12 @@ static void icm_handle_notification(struct work_struct *work)
 			icm->device_disconnected(tb, n->pkg);
 			break;
 		case ICM_EVENT_XDOMAIN_CONNECTED:
-			icm->xdomain_connected(tb, n->pkg);
+			if (tb_xdomain_enabled)
+				icm->xdomain_connected(tb, n->pkg);
 			break;
 		case ICM_EVENT_XDOMAIN_DISCONNECTED:
-			icm->xdomain_disconnected(tb, n->pkg);
+			if (tb_xdomain_enabled)
+				icm->xdomain_disconnected(tb, n->pkg);
 			break;
 		case ICM_EVENT_RTD3_VETO:
 			icm->rtd3_veto(tb, n->pkg);
@@ -2284,6 +2286,8 @@ struct tb *icm_probe(struct tb_nhi *nhi)
 
 	case PCI_DEVICE_ID_INTEL_TGL_NHI0:
 	case PCI_DEVICE_ID_INTEL_TGL_NHI1:
+	case PCI_DEVICE_ID_INTEL_TGL_H_NHI0:
+	case PCI_DEVICE_ID_INTEL_TGL_H_NHI1:
 		icm->is_supported = icm_tgl_is_supported;
 		icm->driver_ready = icm_icl_driver_ready;
 		icm->set_uuid = icm_icl_set_uuid;

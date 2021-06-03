@@ -29,13 +29,8 @@ ap_h1_spi: &spi0 {};
 	};
 };
 
-&ap_sar_sensor {
-	compatible = "semtech,sx9311";
-	status = "okay";
-};
-
-&ap_sar_sensor_i2c {
-	status = "okay";
+&alc5682 {
+	realtek,dmic-clk-driving-high = "true";
 };
 
 ap_ts_pen_1v8: &i2c4 {
@@ -60,6 +55,11 @@ ap_ts_pen_1v8: &i2c4 {
 
 &gpio_keys {
 	status = "okay";
+};
+
+&pen_insert {
+	/* Insert = high, eject = low */
+	gpios = <&tlmm 52 GPIO_ACTIVE_HIGH>;
 };
 
 &panel {
