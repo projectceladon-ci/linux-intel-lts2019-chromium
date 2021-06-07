@@ -4926,6 +4926,11 @@ static void hci_phy_link_complete_evt(struct hci_dev *hdev,
 		return;
 	}
 
+	if (!hcon->amp_mgr) {
+		hci_dev_unlock(hdev);
+		return;
+	}
+
 	if (ev->status) {
 		hci_conn_del(hcon);
 		hci_dev_unlock(hdev);
@@ -5045,10 +5050,12 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
 
 	hci_dev_lock(hdev);
 
-	/* All controllers implicitly stop advertising in the event of a
-	 * connection, so ensure that the state bit is cleared.
+	/* When entering a connection in the slave role, the controller will
+	 * disable advertising. To avoid a lapse in service, we restart any
+	 * previously active advertising instances.
 	 */
-	hci_dev_clear_flag(hdev, HCI_LE_ADV);
+	if (role == HCI_ROLE_SLAVE)
+		hci_req_enable_paused_adv(hdev);
 
 	conn = hci_lookup_le_connect(hdev);
 	if (!conn) {
@@ -5849,20 +5856,18 @@ static void hci_le_direct_adv_report_evt(struct hci_dev *hdev,
 					 struct sk_buff *skb)
 {
 	u8 num_reports = skb->data[0];
-	void *ptr = &skb->data[1];
+	struct hci_ev_le_direct_adv_info *ev = (void *)&skb->data[1];
+
+	if (!num_reports || skb->len < num_reports * sizeof(*ev) + 1)
+		return;
 
 	hci_dev_lock(hdev);
 
-	while (num_reports--) {
-		struct hci_ev_le_direct_adv_info *ev = ptr;
-
+	for (; num_reports; num_reports--, ev++)
 		process_adv_report(hdev, ev->evt_type, &ev->bdaddr,
 				   ev->bdaddr_type, &ev->direct_addr,
 				   ev->direct_addr_type, ev->rssi, NULL, 0,
 				   false);
-
-		ptr += sizeof(*ev);
-	}
 
 	hci_dev_unlock(hdev);
 }

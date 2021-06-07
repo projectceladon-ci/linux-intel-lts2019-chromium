@@ -19,6 +19,7 @@
 #include <linux/security.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 
 static void fuse_advise_use_readdirplus(struct inode *dir)
 {
@@ -425,6 +426,47 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 	return ERR_PTR(err);
 }
 
+static int fuse_initxattrs(struct inode *inode, const struct xattr *xattrs,
+			   void *fs_info)
+{
+	const struct xattr *xattr;
+	int err = 0;
+	int len;
+	char name[XATTR_NAME_MAX + 1];
+
+	for (xattr = xattrs; xattr->name != NULL; ++xattr) {
+		len = scnprintf(name, sizeof(name), XATTR_SECURITY_PREFIX "%s",
+				xattr->name);
+		if (len == sizeof(name)) {
+			err = -EOVERFLOW;
+			break;
+		}
+		err = fuse_setxattr(inode, name, xattr->value, xattr->value_len,
+				    0);
+		if (err < 0)
+			break;
+	}
+
+	return err;
+}
+
+/*
+ * Initialize security xattrs on newly created inodes if supported by the
+ * filesystem.
+ */
+static int fuse_init_security(struct fuse_conn *fc, struct inode *inode,
+			      struct inode *dir, const struct qstr *qstr)
+{
+	int err = 0;
+
+	if (fc->init_security) {
+		err = security_inode_init_security(inode, dir, qstr,
+						   fuse_initxattrs, NULL);
+	}
+
+	return err;
+}
+
 /*
  * Atomic create+open operation
  *
@@ -445,8 +487,6 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	struct fuse_entry_out outentry;
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
-	void *security_ctx = NULL;
-	u32 security_ctxlen = 0;
 
 	/* Userspace expects S_IFREG in create mode */
 	BUG_ON((mode & S_IFMT) != S_IFREG);
@@ -482,23 +522,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	args.out_args[0].value = &outentry;
 	args.out_args[1].size = sizeof(outopen);
 	args.out_args[1].value = &outopen;
-
-	if (fc->init_security) {
-		err = security_dentry_init_security(entry, mode, &entry->d_name,
-						    &security_ctx,
-						    &security_ctxlen);
-		if (err)
-			goto out_free_ff;
-
-		if (security_ctxlen > 0) {
-			args.in_numargs = 3;
-			args.in_args[2].size = security_ctxlen;
-			args.in_args[2].value = security_ctx;
-		}
-	}
-
 	err = fuse_simple_request(fc, &args);
-	kfree(security_ctx);
 	if (err)
 		goto out_free_ff;
 
@@ -517,6 +541,14 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		fuse_sync_release(NULL, ff, flags);
 		fuse_queue_forget(fc, forget, outentry.nodeid, 1);
 		err = -ENOMEM;
+		goto out_err;
+	}
+
+	err = fuse_init_security(fc, inode, dir, &entry->d_name);
+	if (err) {
+		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+		fuse_sync_release(NULL, ff, flags);
+		fuse_queue_forget(fc, forget, outentry.nodeid, 1);
 		goto out_err;
 	}
 	kfree(forget);
@@ -597,8 +629,6 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_args *args,
 	struct dentry *d;
 	int err;
 	struct fuse_forget_link *forget;
-	void *security_ctx = NULL;
-	u32 security_ctxlen = 0;
 
 	forget = fuse_alloc_forget();
 	if (!forget)
@@ -609,29 +639,7 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_args *args,
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(outarg);
 	args->out_args[0].value = &outarg;
-
-	if (init_security) {
-		unsigned short idx = args->in_numargs;
-
-		if ((size_t)idx >= ARRAY_SIZE(args->in_args))
-			return -ENOMEM;
-
-		err = security_dentry_init_security(entry, mode, &entry->d_name,
-						    &security_ctx,
-						    &security_ctxlen);
-		if (err)
-			goto out_put_forget_req;
-
-		if (security_ctxlen > 0) {
-			args->in_args[idx].size = security_ctxlen;
-			args->in_args[idx].value = security_ctx;
-			args->in_numargs++;
-		}
-	}
-
 	err = fuse_simple_request(fc, args);
-	kfree(security_ctx);
-
 	if (err)
 		goto out_put_forget_req;
 
@@ -648,10 +656,34 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_args *args,
 		fuse_queue_forget(fc, forget, outarg.nodeid, 1);
 		return -ENOMEM;
 	}
+	if (args->opcode == FUSE_CHROMEOS_TMPFILE && inode->i_nlink != 0) {
+		fuse_queue_forget(fc, forget, outarg.nodeid, 1);
+		return -EIO;
+	}
+	if (init_security) {
+		err = fuse_init_security(fc, inode, dir, &entry->d_name);
+		if (err) {
+			fuse_queue_forget(fc, forget, outarg.nodeid, 1);
+			return err;
+		}
+	}
 	kfree(forget);
 
 	d_drop(entry);
-	d = d_splice_alias(inode, entry);
+	if (args->opcode == FUSE_CHROMEOS_TMPFILE) {
+		/*
+		 * d_tmpfile will decrement the link count and print a warning
+		 * if the link count is 0, and we checked that the server sent
+		 * us an inode with an nlink count of 0 above.  Set the nlink
+		 * count to 1 to suppress the warning. btrfs does the same
+		 * thing.
+		 */
+		set_nlink(inode, 1);
+		d_tmpfile(entry, inode);
+		d = NULL;
+	} else {
+		d = d_splice_alias(inode, entry);
+	}
 	if (IS_ERR(d))
 		return PTR_ERR(d);
 
@@ -689,8 +721,7 @@ static int fuse_mknod(struct inode *dir, struct dentry *entry, umode_t mode,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = entry->d_name.len + 1;
 	args.in_args[1].value = entry->d_name.name;
-
-	return create_new_entry(fc, &args, dir, entry, mode, fc->init_security);
+	return create_new_entry(fc, &args, dir, entry, mode, true);
 }
 
 static int fuse_create(struct inode *dir, struct dentry *entry, umode_t mode,
@@ -717,9 +748,7 @@ static int fuse_mkdir(struct inode *dir, struct dentry *entry, umode_t mode)
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = entry->d_name.len + 1;
 	args.in_args[1].value = entry->d_name.name;
-
-	return create_new_entry(fc, &args, dir, entry, S_IFDIR,
-				fc->init_security);
+	return create_new_entry(fc, &args, dir, entry, S_IFDIR, true);
 }
 
 static int fuse_chromeos_tmpfile(struct inode *dir, struct dentry *entry,
@@ -740,8 +769,7 @@ static int fuse_chromeos_tmpfile(struct inode *dir, struct dentry *entry,
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
 
-	return create_new_entry(fc, &args, dir, entry, S_IFREG,
-				fc->init_security);
+	return create_new_entry(fc, &args, dir, entry, S_IFREG, true);
 }
 
 static int fuse_symlink(struct inode *dir, struct dentry *entry,
@@ -757,9 +785,7 @@ static int fuse_symlink(struct inode *dir, struct dentry *entry,
 	args.in_args[0].value = entry->d_name.name;
 	args.in_args[1].size = len;
 	args.in_args[1].value = link;
-
-	return create_new_entry(fc, &args, dir, entry, S_IFLNK,
-				fc->init_security);
+	return create_new_entry(fc, &args, dir, entry, S_IFLNK, true);
 }
 
 void fuse_update_ctime(struct inode *inode)
